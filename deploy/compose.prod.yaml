@@ -30,6 +30,9 @@ services:
     env_file: ${TICKETFLOW_ENV_FILE:?Set TICKETFLOW_ENV_FILE}
     environment:
       ATTACHMENT_DIR: /data/attachments
+      COOKIE_SECURE: "1"
+      SESSION_COOKIE_PATH: /ticketflow/api
+      TRUSTED_ORIGINS: https://8.159.144.194
     restart: unless-stopped
     ports: ["127.0.0.1:${TICKETFLOW_API_PORT:-18080}:8000"]
     depends_on:

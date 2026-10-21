@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, onMounted } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import "./style.css";
+import AdminAnalysis from "./AdminAnalysis.vue";
+import OperationGuide from "./OperationGuide.vue";
 type User = {
   id: number;
   username: string;
@@ -38,12 +40,13 @@ type History = {
   created_at: string | null;
 };
 type Attachment = { id: number; filename: string; size: number };
-const token = ref(""),
+const restoring = ref(true);
+const token = ref(false),
   me = ref<User>(),
   busy = ref(false),
   view = ref("dashboard"),
   authTab = ref("login");
-const login = reactive({ username: "", password: "" }),
+const login = reactive({ username: "", password: "", remember: true }),
   registration = reactive({
     username: "",
     display_name: "",
@@ -119,6 +122,8 @@ const labels: Record<string, string> = {
   admin: "管理员",
 };
 const headings: Record<string, string> = {
+  analytics: "分析与报表",
+  help: "操作手册",
   dashboard: "工作台",
   tickets: "工单中心",
   users: "账号与处理组",
@@ -143,7 +148,7 @@ const assignees = computed(() =>
         (u.role === "agent" && u.team_id === selected.value?.team_id)),
   ),
 );
-function logout() {
+function clearSession() {
   ticketDialog.value = false;
   userDialog.value = false;
   teamDialog.value = false;
@@ -160,7 +165,7 @@ function logout() {
   });
   teams.value = [];
 
-  token.value = "";
+  token.value = false;
   me.value = undefined;
   selected.value = undefined;
   rows.value = [];
@@ -172,7 +177,29 @@ function logout() {
   passwordForm.new_password = "";
   passwordForm.confirm = "";
 }
+async function logout() {
+  try {
+    await api("/auth/logout", "POST");
+    clearSession();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "退出失败，请重试。");
+  }
+}
+onMounted(async () => {
+  try {
+    me.value = await api("/auth/me");
+    token.value = true;
+    await Promise.all([load(), loadPeople()]);
+  } catch (e) {
+    if (token.value) ElMessage.error("工作台暂时无法加载，请刷新重试。");
+  } finally {
+    restoring.value = false;
+  }
+});
 const errors: Record<string, string> = {
+  "Report exceeds 10000 rows; narrow the filters":
+    "报表超过10,000行，请缩小筛选范围后导出。",
+  "Choose a date range of at most 366 days": "请选择有效日期范围，最多366天。",
   "Invalid credentials": "账号或密码不正确；新注册账号需先通过管理员审核。",
   "Invalid or expired token": "登录已失效，请重新登录。",
   "Username already exists": "此账号已被使用，请更换。",
@@ -198,8 +225,8 @@ async function request(
     import.meta.env.BASE_URL.replace(/\/$/, "") + "/api" + path,
     {
       method,
+      credentials: "same-origin",
       headers: {
-        ...(token.value ? { Authorization: "Bearer " + token.value } : {}),
         ...(body !== undefined
           ? {
               "Content-Type": raw
@@ -218,7 +245,7 @@ async function request(
   );
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    if (res.status === 401 && token.value) logout();
+    if (res.status === 401 && token.value) clearSession();
     throw new Error(
       errors[data.detail] ||
         (res.status === 429
@@ -289,8 +316,8 @@ async function loadPeople() {
   if (isStaff.value) users.value = await api("/users");
 }
 async function signIn() {
-  const data = await api("/auth/login", "POST", login);
-  token.value = data.access_token;
+  await api("/auth/login", "POST", login);
+  token.value = true;
   me.value = await api("/auth/me");
   login.password = "";
   internal.value = false;
@@ -565,13 +592,16 @@ async function changePassword() {
     current_password: passwordForm.current_password,
     new_password: passwordForm.new_password,
   });
-  logout();
+  clearSession();
   ElMessage.success("密码已修改，请重新登录。");
 }
 </script>
 
 <template>
-  <div v-if="!token" class="auth-layout">
+  <div v-if="restoring" class="session-restoring" role="status">
+    正在恢复登录状态…
+  </div>
+  <div v-else-if="!token" class="auth-layout">
     <section class="auth-story">
       <a class="brand"><span class="brand-mark">T</span> TicketFlow</a>
       <div class="story-copy">
@@ -627,7 +657,10 @@ async function changePassword() {
               placeholder="请输入密码"
               show-password
               required /></el-form-item
-          ><el-button
+          ><el-checkbox v-model="login.remember"
+            >保持登录30天（公共电脑请取消）</el-checkbox
+          >
+          <el-button
             type="primary"
             native-type="submit"
             class="full"
@@ -697,9 +730,13 @@ async function changePassword() {
             { key: 'dashboard', icon: '◫', label: '工作台' },
             { key: 'tickets', icon: '▤', label: '工单中心' },
             ...(me?.role === 'admin'
-              ? [{ key: 'users', icon: '♙', label: '账号与处理组' }]
+              ? [
+                  { key: 'analytics', icon: '▥', label: '分析与报表' },
+                  { key: 'users', icon: '♙', label: '账号与处理组' },
+                ]
               : []),
             { key: 'settings', icon: '⚙', label: '个人设置' },
+            { key: 'help', icon: '?', label: '操作手册' },
           ]"
           :key="item.key"
           :class="{ active: view === item.key }"
@@ -750,7 +787,11 @@ async function changePassword() {
                   ? "TICKET CENTER"
                   : view === "users"
                     ? "TEAM & ACCOUNTS"
-                    : "YOUR PROFILE"
+                    : view === "analytics"
+                      ? "ANALYTICS"
+                      : view === "help"
+                        ? "GUIDE"
+                        : "YOUR PROFILE"
             }}</span>
             <h1>{{ headings[view] }}</h1>
             <p class="muted">
@@ -761,7 +802,11 @@ async function changePassword() {
                     ? "让问题有记录，让处理有进展。"
                     : view === "users"
                       ? "审核注册申请，维护账号与团队分工。"
-                      : "管理账号资料与登录密码。"
+                      : view === "analytics"
+                        ? "用数据了解工单分布，导出团队工作报表。"
+                        : view === "help"
+                          ? "查看操作步骤、统计口径与常见问题。"
+                          : "管理账号资料与登录密码。"
               }}
             </p>
           </div>
@@ -778,6 +823,13 @@ async function changePassword() {
             >＋ 创建账号</el-button
           >
         </div>
+        <AdminAnalysis
+          v-if="view === 'analytics' && me?.role === 'admin'"
+          :request="request"
+          :teams="teams"
+          :users="users"
+        />
+        <OperationGuide v-if="view === 'help'" :admin="me?.role === 'admin'" />
         <template v-if="view === 'dashboard'"
           ><div class="stat-grid">
             <button class="stat-card" @click="guard(() => quickStatus(''))">

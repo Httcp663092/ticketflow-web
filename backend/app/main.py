@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 import jwt
 from .security import passwords
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.exc import IntegrityError
@@ -17,7 +17,17 @@ from .accounts import throttle, profile
 
 app = FastAPI(title="TicketFlow", version="0.1.0")
 _dummy_password_hash = passwords.hash("dummy-password-for-timing-only")
-bearer = HTTPBearer()
+bearer = HTTPBearer(auto_error=False)
+COOKIE_NAME = "ticketflow_session"
+
+
+def cookie_options():
+    return dict(
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "1") == "1",
+        samesite="strict",
+        path=os.getenv("SESSION_COOKIE_PATH", "/api"),
+    )
 
 
 def secret():
@@ -30,6 +40,7 @@ def secret():
 class Login(BaseModel):
     username: str = Field(max_length=80)
     password: str = Field(max_length=128)
+    remember: bool = False
 
 
 class TicketIn(BaseModel):
@@ -69,11 +80,15 @@ class Comment(BaseModel):
 
 
 def current(
-    auth: HTTPAuthorizationCredentials = Depends(bearer),
+    request: Request,
+    auth: HTTPAuthorizationCredentials | None = Depends(bearer),
     db: Session = Depends(database),
 ):
     try:
-        data = jwt.decode(auth.credentials, secret(), algorithms=["HS256"])
+        encoded = auth.credentials if auth else request.cookies.get(COOKIE_NAME)
+        if not encoded:
+            raise ValueError()
+        data = jwt.decode(encoded, secret(), algorithms=["HS256"])
         user = db.get(User, int(data["sub"]))
         if not user or not user.active or data.get("ver", 0) != user.token_version:
             raise ValueError()
@@ -115,8 +130,28 @@ def health():
     return {"status": "ok"}
 
 
+@app.middleware("http")
+async def protect_cookie_writes(request: Request, call_next):
+    # SameSite cookies plus an Origin check protect writes and login against CSRF.
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        expected = str(request.base_url).rstrip("/")
+        trusted = {v for v in os.getenv("TRUSTED_ORIGINS", "").split(",") if v}
+        if origin and origin != expected and origin not in trusted:
+            return JSONResponse({"detail": "Untrusted request origin"}, status_code=403)
+        if (
+            request.cookies.get(COOKIE_NAME)
+            and not request.headers.get("authorization")
+            and not origin
+        ):
+            return JSONResponse({"detail": "Origin header required"}, status_code=403)
+    return await call_next(request)
+
+
 @app.post("/api/auth/login")
-def login(body: Login, request: Request, db: Session = Depends(database)):
+def login(
+    body: Login, request: Request, response: Response, db: Session = Depends(database)
+):
     throttle(db, request, "login", 30)
     user = db.scalar(
         select(User).where(func.lower(User.username) == body.username.strip().lower())
@@ -126,19 +161,35 @@ def login(body: Login, request: Request, db: Session = Depends(database)):
     )
     if not user or not user.active or not valid_password:
         raise HTTPException(401, "Invalid credentials")
-    return {
-        "access_token": jwt.encode(
-            {
-                "sub": str(user.id),
-                "ver": user.token_version,
-                "exp": datetime.now(timezone.utc) + timedelta(hours=8),
-            },
-            secret(),
-            algorithm="HS256",
-        ),
-        "token_type": "bearer",
-        "role": user.role,
-    }
+    lifetime = timedelta(days=30) if body.remember else timedelta(hours=8)
+    encoded = jwt.encode(
+        {
+            "sub": str(user.id),
+            "ver": user.token_version,
+            "exp": datetime.now(timezone.utc) + lifetime,
+        },
+        secret(),
+        algorithm="HS256",
+    )
+    response.set_cookie(
+        COOKIE_NAME,
+        encoded,
+        max_age=int(lifetime.total_seconds()) if body.remember else None,
+        **cookie_options(),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"access_token": encoded, "token_type": "bearer", "role": user.role}
+
+
+@app.post("/api/auth/logout")
+def logout(
+    response: Response, db: Session = Depends(database), user: User = Depends(current)
+):
+    user.token_version += 1
+    db.commit()
+    response.delete_cookie(COOKIE_NAME, **cookie_options())
+    response.headers["Cache-Control"] = "no-store"
+    return {"ok": True}
 
 
 @app.get("/api/tickets", response_model=list[TicketOut])
@@ -580,3 +631,8 @@ def route_ticket(
     )
     db.commit()
     return ticket
+
+
+from .analytics import make_router as analytics_router
+
+app.include_router(analytics_router(current))

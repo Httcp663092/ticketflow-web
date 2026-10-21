@@ -1102,3 +1102,5 @@ small {
     min-width: 170px;
   }
 }
+
+.session-restoring{min-height:100vh;display:grid;place-items:center;color:#39745e;background:#f5f8f5;font-size:16px}
