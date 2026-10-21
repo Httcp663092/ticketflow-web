@@ -1,0 +1,7 @@
+[Unit]
+Description=TicketFlow database and attachment backup
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/ticketflow/current/deploy/backup.sh
+UMask=0077

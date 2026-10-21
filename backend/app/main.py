@@ -2,7 +2,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 import jwt
-from pwdlib import PasswordHash
+from .security import passwords
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm.exc import StaleDataError
@@ -16,7 +16,6 @@ from .models import User, Ticket, Event, Team
 from .accounts import throttle, profile
 
 app = FastAPI(title="TicketFlow", version="0.1.0")
-passwords = PasswordHash.recommended()
 _dummy_password_hash = passwords.hash("dummy-password-for-timing-only")
 bearer = HTTPBearer()
 

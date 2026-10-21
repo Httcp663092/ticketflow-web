@@ -194,25 +194,28 @@ async function request(
   body?: unknown,
   raw = false,
 ) {
-  const res = await fetch("/api" + path, {
-    method,
-    headers: {
-      ...(token.value ? { Authorization: "Bearer " + token.value } : {}),
-      ...(body !== undefined
-        ? {
-            "Content-Type": raw
-              ? "application/octet-stream"
-              : "application/json",
-          }
-        : {}),
+  const res = await fetch(
+    import.meta.env.BASE_URL.replace(/\/$/, "") + "/api" + path,
+    {
+      method,
+      headers: {
+        ...(token.value ? { Authorization: "Bearer " + token.value } : {}),
+        ...(body !== undefined
+          ? {
+              "Content-Type": raw
+                ? "application/octet-stream"
+                : "application/json",
+            }
+          : {}),
+      },
+      body:
+        body === undefined
+          ? undefined
+          : raw
+            ? (body as Blob)
+            : JSON.stringify(body),
     },
-    body:
-      body === undefined
-        ? undefined
-        : raw
-          ? (body as Blob)
-          : JSON.stringify(body),
-  });
+  );
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     if (res.status === 401 && token.value) logout();
