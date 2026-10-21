@@ -51,7 +51,8 @@ class TicketOut(TicketIn):
 
 
 class Change(BaseModel):
-    status: Literal["open", "in_progress", "resolved", "closed"]
+    status: Literal["open", "in_progress", "resolved", "closed", "cancelled"]
+    reason: str = Field(default="", max_length=1000)
     version: int = Field(ge=1)
 
 
@@ -61,6 +62,8 @@ class Assignment(BaseModel):
 
 
 class Comment(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    internal: bool = False
     message: str = Field(min_length=1, max_length=10000)
 
 
@@ -93,8 +96,16 @@ def visible(ticket_id, db, user):
     return ticket
 
 
-def log(db, ticket, user, message):
-    db.add(Event(ticket_id=ticket.id, actor_id=user.id, message=message))
+def log(db, ticket, user, message, internal=False, kind="system"):
+    db.add(
+        Event(
+            ticket_id=ticket.id,
+            actor_id=user.id,
+            message=message,
+            internal=internal,
+            kind=kind,
+        )
+    )
     ticket.updated_at = datetime.now(timezone.utc)
 
 
@@ -186,18 +197,36 @@ def change(
     if ticket.version != body.version:
         raise HTTPException(409, "Ticket changed; reload before retry")
     allowed = {
-        "open": {"in_progress"},
-        "in_progress": {"resolved"},
-        "resolved": {"closed", "in_progress"},
-        "closed": set(),
+        "open": {"in_progress", "cancelled"},
+        "in_progress": {"resolved", "cancelled"},
+        "resolved": {"closed", "in_progress", "cancelled"},
+        "closed": {"in_progress"},
+        "cancelled": set(),
     }
+    if body.status == "cancelled" and user.role != "admin":
+        raise HTTPException(403, "Admin role required to cancel")
+    needs_reason = body.status == "cancelled" or (
+        ticket.status in {"closed", "resolved"} and body.status == "in_progress"
+    )
+    reason = body.reason.strip()
+    if needs_reason and not reason:
+        raise HTTPException(422, "A reason is required")
     if user.role == "requester" and not (
-        ticket.status == "resolved" and body.status == "closed"
+        ticket.status == "resolved"
+        and body.status in {"closed", "in_progress"}
+        or ticket.status == "closed"
+        and body.status == "in_progress"
     ):
         raise HTTPException(403, "Agent role required")
     if body.status not in allowed[ticket.status]:
         raise HTTPException(409, "Invalid transition")
-    log(db, ticket, user, f"Status {ticket.status} -> {body.status}")
+    log(
+        db,
+        ticket,
+        user,
+        f"Status {ticket.status} -> {body.status}"
+        + (f"; Reason: {reason}" if reason else ""),
+    )
     ticket.status = body.status
     db.commit()
     return ticket
@@ -214,7 +243,7 @@ def assign(
         raise HTTPException(403, "Admin role required")
     ticket = visible(ticket_id, db, user)
     target = db.get(User, body.assignee_id)
-    if not target or target.role not in {"admin", "agent"}:
+    if not target or not target.active or target.role not in {"admin", "agent"}:
         raise HTTPException(422, "Assignee must be an agent")
     if ticket.version != body.version:
         raise HTTPException(409, "Ticket changed; reload before retry")
@@ -236,7 +265,9 @@ def comment(
     user: User = Depends(current),
 ):
     ticket = visible(ticket_id, db, user)
-    log(db, ticket, user, body.message)
+    if body.internal and user.role == "requester":
+        raise HTTPException(403, "Staff role required for internal notes")
+    log(db, ticket, user, body.message, internal=body.internal, kind="comment")
     db.commit()
     return {"ok": True}
 
@@ -252,9 +283,16 @@ def events(
             "actor_id": e.actor_id,
             "message": e.message,
             "created_at": e.created_at,
+            "internal": e.internal,
+            "kind": e.kind,
         }
         for e in db.scalars(
-            select(Event).where(Event.ticket_id == ticket_id).order_by(Event.id)
+            select(Event)
+            .where(
+                Event.ticket_id == ticket_id,
+                Event.internal.is_(False) if user.role == "requester" else True,
+            )
+            .order_by(Event.id)
         )
     ]
 
@@ -373,3 +411,8 @@ def disable_user(
     target.active = body.active
     db.commit()
     return {"id": target.id, "active": target.active}
+
+
+from .attachments import make_router
+
+app.include_router(make_router(current, visible, log))

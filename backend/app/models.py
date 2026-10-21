@@ -49,6 +49,22 @@ class Event(Base):
     ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"))
     actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     message: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(String(20), default="system")
+    internal: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class Attachment(Base):
+    __tablename__ = "attachments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), index=True)
+    uploader_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    filename: Mapped[str] = mapped_column(String(200))
+    storage_key: Mapped[str] = mapped_column(String(64), unique=True)
+    content_type: Mapped[str] = mapped_column(String(100))
+    size: Mapped[int] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

@@ -289,3 +289,218 @@ def test_database_optimistic_lock():
     with factory() as db:
         assert db.get(Ticket, 1).title == "First write"
     engine.dispose()
+
+
+def test_internal_notes_are_hidden_from_requesters(client):
+    alice, agent = auth(client, "alice"), auth(client, "agent")
+    ticket = create(client, alice).json()
+    path = f"/api/tickets/{ticket['id']}"
+    assert (
+        client.post(
+            path + "/comments",
+            headers=alice,
+            json={"message": "secret", "internal": True},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            path + "/comments",
+            headers=agent,
+            json={"message": "Staff diagnostic", "internal": True},
+        ).status_code
+        == 201
+    )
+    assert (
+        client.post(
+            path + "/comments", headers=alice, json={"message": "   "}
+        ).status_code
+        == 422
+    )
+    public = client.get(path + "/events", headers=alice).json()
+    staff = client.get(path + "/events", headers=agent).json()
+    assert not any(e["internal"] or e["message"] == "Staff diagnostic" for e in public)
+    assert any(e["internal"] and e["message"] == "Staff diagnostic" for e in staff)
+
+
+def test_reopen_cancel_permissions_reasons_and_versions(client):
+    alice, agent, admin = (
+        auth(client, "alice"),
+        auth(client, "agent"),
+        auth(client, "admin"),
+    )
+    ticket = create(client, alice).json()
+    path = f"/api/tickets/{ticket['id']}"
+
+    def change_as(headers, state, reason=""):
+        version = client.get(path, headers=alice).json()["version"]
+        return client.patch(
+            path + "/status",
+            headers=headers,
+            json={"status": state, "version": version, "reason": reason},
+        )
+
+    assert change_as(agent, "in_progress").status_code == 200
+    assert change_as(agent, "resolved").status_code == 200
+    assert change_as(alice, "in_progress").status_code == 422
+    assert change_as(alice, "in_progress", "Problem persists").status_code == 200
+    assert change_as(agent, "resolved").status_code == 200
+    assert change_as(alice, "closed").status_code == 200
+    stale = client.get(path, headers=alice).json()["version"]
+    assert change_as(alice, "in_progress", "Recurring failure").status_code == 200
+    assert (
+        client.patch(
+            path + "/status",
+            headers=admin,
+            json={"status": "cancelled", "version": stale, "reason": "Duplicate"},
+        ).status_code
+        == 409
+    )
+    assert change_as(alice, "cancelled", "Duplicate").status_code == 403
+    assert change_as(agent, "cancelled", "Duplicate").status_code == 403
+    assert change_as(admin, "cancelled", " ").status_code == 422
+    assert change_as(admin, "cancelled", "Duplicate ticket").status_code == 200
+    assert change_as(admin, "in_progress", "Retry").status_code == 409
+    events = client.get(path + "/events", headers=admin).json()
+    assert any("Recurring failure" in e["message"] for e in events)
+    assert any("Duplicate ticket" in e["message"] for e in events)
+
+
+def test_attachments_download_scope_validation_and_cleanup(
+    client, tmp_path, monkeypatch
+):
+    from app import attachments
+
+    monkeypatch.setenv("ATTACHMENT_DIR", str(tmp_path))
+    alice, bob = auth(client, "alice"), auth(client, "bob")
+    ticket = create(client, alice).json()
+    path = f"/api/tickets/{ticket['id']}/attachments"
+    headers = {**alice, "Content-Type": "application/octet-stream"}
+    upload = client.post(
+        path,
+        params={"filename": "说明.txt"},
+        headers=headers,
+        content="问题详情".encode(),
+    )
+    assert upload.status_code == 201
+    file = upload.json()
+    url = f"{path}/{file['id']}"
+    assert client.get(url, headers=alice).content == "问题详情".encode()
+    assert client.get(url, headers=alice).headers["x-content-type-options"] == "nosniff"
+    assert (
+        "attachment;" in client.get(url, headers=alice).headers["content-disposition"]
+    )
+    assert client.get(url, headers=bob).status_code == 404
+    assert client.get(path, headers=bob).status_code == 404
+    assert (
+        client.post(
+            path, params={"filename": "private.txt"}, headers=bob, content=b"forbidden"
+        ).status_code
+        == 404
+    )
+    assert client.get(url).status_code in {401, 403}
+    other = create(client, alice).json()
+    assert (
+        client.get(
+            f"/api/tickets/{other['id']}/attachments/{file['id']}", headers=alice
+        ).status_code
+        == 404
+    )
+    for filename, content, code in [
+        ("../bad.txt", b"bad", 422),
+        ("bad.html", b"<script>", 415),
+        ("bad.png", b"fake image", 415),
+        ("empty.txt", b"", 422),
+        ("bad.txt", b"\xff", 415),
+        ("binary.csv", b"a\x00b", 415),
+    ]:
+        assert (
+            client.post(
+                path, params={"filename": filename}, headers=headers, content=content
+            ).status_code
+            == code
+        )
+    monkeypatch.setattr(attachments, "MAX_BYTES", 5)
+    assert (
+        client.post(
+            path, params={"filename": "large.txt"}, headers=headers, content=b"123456"
+        ).status_code
+        == 413
+    )
+    assert len(list(tmp_path.iterdir())) == 1
+    assert len(client.get(path, headers=alice).json()) == 1
+
+
+def test_attachment_failed_commit_removes_file_and_audit(client, tmp_path, monkeypatch):
+    from sqlalchemy.orm import Session as SASession
+    from sqlalchemy.orm.exc import StaleDataError
+
+    monkeypatch.setenv("ATTACHMENT_DIR", str(tmp_path))
+    alice = auth(client, "alice")
+    ticket = create(client, alice).json()
+    path = f"/api/tickets/{ticket['id']}"
+    with monkeypatch.context() as patch:
+
+        def stale(self):
+            raise StaleDataError("Concurrent writer")
+
+        patch.setattr(SASession, "commit", stale)
+        response = client.post(
+            path + "/attachments",
+            params={"filename": "failed.txt"},
+            headers=alice,
+            content=b"test",
+        )
+        assert response.status_code == 409
+    assert not list(tmp_path.iterdir())
+    assert client.get(path + "/attachments", headers=alice).json() == []
+    assert len(client.get(path + "/events", headers=alice).json()) == 1
+
+
+def test_attachment_utf8_boundary_signatures_and_count_limit(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ATTACHMENT_DIR", str(tmp_path))
+    alice = auth(client, "alice")
+    ticket = create(client, alice).json()
+    path = f"/api/tickets/{ticket['id']}/attachments"
+    content = b"a" * 65535 + "中文".encode()
+    uploaded = client.post(
+        path, headers=alice, params={"filename": "unicode.csv"}, content=content
+    )
+    assert uploaded.status_code == 201
+    assert (
+        client.get(path + f"/{uploaded.json()['id']}", headers=alice).content == content
+    )
+    for name, content in [
+        ("header.png", b"\x89PNG\r\n\x1a\n"),
+        ("header.jpg", b"\xff\xd8\xff"),
+        ("header.pdf", b"%PDF-1.7"),
+    ]:
+        assert (
+            client.post(
+                path, headers=alice, params={"filename": name}, content=content
+            ).status_code
+            == 201
+        )
+    for i in range(16):
+        assert (
+            client.post(
+                path,
+                headers=alice,
+                params={"filename": f"file-{i}.txt"},
+                content=b"test",
+            ).status_code
+            == 201
+        )
+    assert (
+        client.post(
+            path, headers=alice, params={"filename": "overflow.txt"}, content=b"test"
+        ).status_code
+        == 413
+    )
+    assert (
+        len(client.get(path, headers=alice).json())
+        == len(list(tmp_path.iterdir()))
+        == 20
+    )
