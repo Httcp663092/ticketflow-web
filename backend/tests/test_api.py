@@ -504,3 +504,271 @@ def test_attachment_utf8_boundary_signatures_and_count_limit(
         == len(list(tmp_path.iterdir()))
         == 20
     )
+
+
+def test_registration_requires_approval_and_cannot_choose_role(client):
+    admin = auth(client, "admin")
+    body = {
+        "username": "New.Member",
+        "display_name": "新成员",
+        "password": "strong-member-password",
+    }
+    assert (
+        client.post("/api/auth/register", json={**body, "role": "admin"}).status_code
+        == 422
+    )
+    assert client.post("/api/auth/register", json=body).status_code == 201
+    assert (
+        client.post(
+            "/api/auth/register", json={**body, "username": "NEW.MEMBER"}
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            "/api/auth/login",
+            json={"username": "new.member", "password": body["password"]},
+        ).status_code
+        == 401
+    )
+    users = client.get("/api/users", headers=admin).json()
+    new = next(u for u in users if u["username"] == "new.member")
+    assert (
+        new["role"] == "requester" and new["registration_pending"] and not new["active"]
+    )
+    assert (
+        client.patch(
+            f"/api/users/{new['id']}",
+            headers=auth(client, "alice"),
+            json={"active": True},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.patch(
+            f"/api/users/{new['id']}",
+            headers=admin,
+            json={"active": True, "team_id": 1},
+        ).status_code
+        == 200
+    )
+    headers = auth(client, "NEW.MEMBER", body["password"])
+    profile = client.get("/api/auth/me", headers=headers).json()
+    assert profile["display_name"] == "新成员" and not profile["registration_pending"]
+    assert profile["role"] == "requester" and "password_hash" not in profile
+
+
+def test_password_change_revokes_all_old_sessions(client):
+    alice = auth(client, "alice")
+    second = auth(client, "alice")
+    assert (
+        client.post(
+            "/api/auth/password",
+            headers=alice,
+            json={"current_password": "wrong", "new_password": "new-strong-password"},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/api/auth/password",
+            headers=alice,
+            json={"current_password": "test-password", "new_password": "test-password"},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/api/auth/password",
+            headers=alice,
+            json={
+                "current_password": "test-password",
+                "new_password": "new-strong-password",
+            },
+        ).status_code
+        == 200
+    )
+    for old in [alice, second]:
+        assert client.get("/api/auth/me", headers=old).status_code == 401
+    assert (
+        client.post(
+            "/api/auth/login", json={"username": "alice", "password": "test-password"}
+        ).status_code
+        == 401
+    )
+    assert (
+        client.get(
+            "/api/auth/me", headers=auth(client, "alice", "new-strong-password")
+        ).status_code
+        == 200
+    )
+
+
+def test_account_edit_and_reenable_does_not_restore_old_token(client):
+    admin = auth(client, "admin")
+    agent = auth(client, "agent")
+    team = client.post("/api/teams", headers=admin, json={"name": "Other team"}).json()
+    alice = auth(client, "alice")
+    ticket = create(client, alice).json()
+    assert client.get(f"/api/tickets/{ticket['id']}", headers=agent).status_code == 200
+    assert (
+        client.patch(
+            "/api/users/3",
+            headers=admin,
+            json={"team_id": team["id"], "display_name": "处理人甲"},
+        ).status_code
+        == 200
+    )
+    assert client.get(f"/api/tickets/{ticket['id']}", headers=agent).status_code == 404
+    assert (
+        client.get("/api/auth/me", headers=agent).json()["display_name"] == "处理人甲"
+    )
+    assert (
+        client.patch("/api/users/3", headers=admin, json={"team_id": 99999}).status_code
+        == 422
+    )
+    assert (
+        client.patch("/api/users/3", headers=admin, json={"active": False}).status_code
+        == 200
+    )
+    assert (
+        client.patch("/api/users/3", headers=admin, json={"active": True}).status_code
+        == 200
+    )
+    assert client.get("/api/auth/me", headers=agent).status_code == 401
+    assert client.get("/api/auth/me", headers=auth(client, "agent")).status_code == 200
+
+
+def test_search_pagination_dashboard_and_permissions(client):
+    alice = auth(client, "alice")
+    bob = auth(client, "bob")
+    a = create(client, alice).json()
+    b = create(client, bob).json()
+    client.post(
+        "/api/tickets",
+        headers=alice,
+        json={
+            "title": "Routine 100% check",
+            "description": "Maintenance",
+            "category": "operations",
+            "priority": "low",
+            "team_id": 1,
+        },
+    )
+    result = client.get("/api/ticket-search?limit=1&offset=1", headers=alice).json()
+    assert result["total"] == 2 and len(result["items"]) == 1
+    assert all(t["creator_id"] == 1 for t in result["items"])
+    assert (
+        client.get(
+            "/api/ticket-search?category=operations&priority=low", headers=alice
+        ).json()["total"]
+        == 1
+    )
+    assert client.get("/api/ticket-search?q=100%25", headers=alice).json()["total"] == 1
+    assert (
+        client.get("/api/ticket-search?q=" + str(b["id"]), headers=alice).json()[
+            "total"
+        ]
+        == 0
+    )
+    assert (
+        client.get("/api/ticket-search?q=TF-" + str(a["id"]), headers=alice).json()[
+            "total"
+        ]
+        == 1
+    )
+    dashboard = client.get("/api/dashboard", headers=alice).json()
+    assert (
+        dashboard["total"] == 2
+        and dashboard["by_status"] == {"open": 2}
+        and dashboard["urgent"] == 1
+    )
+    assert client.get("/api/dashboard", headers=bob).json()["total"] == 1
+    assert (
+        client.get("/api/dashboard", headers=auth(client, "admin")).json()["total"] == 3
+    )
+    assert (
+        client.get(
+            "/api/ticket-search?mine=true", headers=auth(client, "agent")
+        ).json()["total"]
+        == 0
+    )
+
+
+def test_login_attempts_are_rate_limited(client):
+    for i in range(30):
+        assert (
+            client.post(
+                "/api/auth/login", json={"username": "unknown", "password": "wrong"}
+            ).status_code
+            == 401
+        )
+    assert (
+        client.post(
+            "/api/auth/login", json={"username": "unknown", "password": "wrong"}
+        ).status_code
+        == 429
+    )
+
+
+def test_registration_rate_limit(client):
+    for i in range(5):
+        assert (
+            client.post(
+                "/api/auth/register",
+                json={
+                    "username": f"signup{i}",
+                    "display_name": "Member",
+                    "password": "strong-member-password",
+                },
+            ).status_code
+            == 201
+        )
+    assert (
+        client.post(
+            "/api/auth/register",
+            json={
+                "username": "signup6",
+                "display_name": "Member",
+                "password": "strong-member-password",
+            },
+        ).status_code
+        == 429
+    )
+
+
+def test_routing_changes_group_and_clears_assignee(client):
+    admin = auth(client, "admin")
+    alice = auth(client, "alice")
+    agent = auth(client, "agent")
+    ticket = create(client, alice).json()
+    path = f"/api/tickets/{ticket['id']}"
+    assigned = client.patch(
+        path + "/assignee",
+        headers=admin,
+        json={"assignee_id": 3, "version": ticket["version"]},
+    ).json()
+    group = client.post(
+        "/api/teams", headers=admin, json={"name": "Routed group"}
+    ).json()
+    body = {
+        "team_id": group["id"],
+        "version": assigned["version"],
+        "reason": "Transferred to specialist team",
+    }
+    assert client.patch(path + "/team", headers=agent, json=body).status_code == 403
+    routed = client.patch(path + "/team", headers=admin, json=body)
+    assert routed.status_code == 200 and routed.json()["assignee_id"] is None
+    assert client.get(path, headers=agent).status_code == 404
+    assert client.get(path, headers=alice).status_code == 200
+    assert client.patch(path + "/team", headers=admin, json=body).status_code == 409
+    assert (
+        client.get(
+            "/api/ticket-search?q=TF-" + str(ticket["id"]).zfill(5), headers=alice
+        ).json()["total"]
+        == 1
+    )
+    assert (
+        client.get("/api/ticket-search?active_only=true", headers=alice).json()["total"]
+        == 1
+    )

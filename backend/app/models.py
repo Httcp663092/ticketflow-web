@@ -16,6 +16,9 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(80), unique=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="requester")
+    display_name: Mapped[str] = mapped_column(String(80), default="")
+    token_version: Mapped[int] = mapped_column(default=0)
+    registration_pending: Mapped[bool] = mapped_column(default=False)
     active: Mapped[bool] = mapped_column(default=True)
     team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id"), nullable=True)
 
@@ -68,3 +71,10 @@ class Attachment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+
+class RateBucket(Base):
+    __tablename__ = "rate_buckets"
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    bucket: Mapped[int] = mapped_column(primary_key=True)
+    attempts: Mapped[int] = mapped_column(default=1)
